@@ -18,7 +18,6 @@ type OnError = Rc<dyn Fn(&gloo_net::Error)>;
 )]
 #[component]
 pub fn Form<A>(
-    cx: Scope,
     /// [`method`](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/form#attr-method)
     /// is the HTTP method to submit the form with (`get` or `post`).
     #[prop(optional)]
@@ -64,7 +63,6 @@ where
     A: ToHref + 'static,
 {
     fn inner(
-        cx: Scope,
         method: Option<&'static str>,
         action: Memo<Option<String>>,
         enctype: Option<String>,
@@ -84,7 +82,7 @@ where
                 if ev.default_prevented() {
                     return;
                 }
-                let navigate = use_navigate(cx);
+                let navigate = use_navigate();
 
                 let (form, method, action, enctype) =
                     extract_form_attributes(&ev);
@@ -99,7 +97,7 @@ where
                         &form_data,
                     )
                     .unwrap_throw();
-                let action = use_resolved_path(cx, move || action.clone())
+                let action = use_resolved_path(move || action.clone())
                     .get_untracked()
                     .unwrap_or_default();
                 // multipart POST (setting Context-Type breaks the request)
@@ -288,13 +286,13 @@ where
 
         let method = method.unwrap_or("get");
 
-        let mut form = form(cx)
+        let mut form = form()
             .attr("method", method)
             .attr("action", move || action.get())
             .attr("enctype", enctype)
             .on(ev::submit, on_submit)
             .attr("class", class)
-            .child(children(cx));
+            .child(children());
         if let Some(node_ref) = node_ref {
             form = form.node_ref(node_ref)
         };
@@ -309,10 +307,9 @@ where
         form
     }
 
-    let action = use_resolved_path(cx, move || action.to_href()());
-    let class = class.map(|bx| bx.into_attribute_boxed(cx));
+    let action = use_resolved_path(move || action.to_href()());
+    let class = class.map(|bx| bx.into_attribute_boxed());
     inner(
-        cx,
         method,
         action,
         enctype,
@@ -343,7 +340,6 @@ where
 )]
 #[component]
 pub fn ActionForm<I, O>(
-    cx: Scope,
     /// The action from which to build the form. This should include a URL, which can be generated
     /// by default using [create_server_action](leptos_server::create_server_action) or added
     /// manually using [leptos_server::Action::using_server_fn].
@@ -381,7 +377,7 @@ where
     let input = action.input();
 
     let on_error = Rc::new(move |e: &gloo_net::Error| {
-        cx.batch(move || {
+        batch(move || {
             action.set_pending(false);
             let e = ServerFnError::Request(e.to_string());
             value.try_set(Some(Err(e.clone())));
@@ -395,7 +391,7 @@ where
         let data = I::from_form_data(form_data);
         match data {
             Ok(data) => {
-                cx.batch(move || {
+                batch(move || {
                     input.try_set(Some(data));
                     action.set_pending(true);
                 });
@@ -403,7 +399,7 @@ where
             Err(e) => {
                 error!("{e}");
                 let e = ServerFnError::Serialization(e.to_string());
-                cx.batch(move || {
+                batch(move || {
                     value.try_set(Some(Err(e.clone())));
                     if let Some(error) = error {
                         error
@@ -481,13 +477,13 @@ where
                     }
                 };
             }
-            cx.batch(move || {
+            batch(move || {
                 input.try_set(None);
                 action.set_pending(false);
             });
         });
     });
-    let class = class.map(|bx| bx.into_attribute_boxed(cx));
+    let class = class.map(|bx| bx.into_attribute_boxed());
     let mut props = FormProps::builder()
         .action(action_url)
         .version(version)
@@ -495,13 +491,13 @@ where
         .on_response(on_response)
         .on_error(on_error)
         .method("post")
-        .class(class)
+        // TODO Fix.class(class.map(|c| c.into_attribute()))
         .children(children)
         .build();
     props.error = error;
     props.node_ref = node_ref;
     props.attributes = attributes;
-    Form(cx, props)
+    Form(props)
 }
 
 /// Automatically turns a server [MultiAction](leptos_server::MultiAction) into an HTML
@@ -513,7 +509,6 @@ where
 )]
 #[component]
 pub fn MultiActionForm<I, O>(
-    cx: Scope,
     /// The action from which to build the form. This should include a URL, which can be generated
     /// by default using [create_server_action](leptos_server::create_server_action) or added
     /// manually using [leptos_server::Action::using_server_fn].
@@ -571,13 +566,13 @@ where
         }
     };
 
-    let class = class.map(|bx| bx.into_attribute_boxed(cx));
-    let mut form = form(cx)
+    let class = class.map(|bx| bx.into_attribute_boxed());
+    let mut form = form()
         .attr("method", "POST")
         .attr("action", action)
         .on(ev::submit, on_submit)
         .attr("class", class)
-        .child(children(cx));
+        .child(children());
     if let Some(node_ref) = node_ref {
         form = form.node_ref(node_ref)
     };

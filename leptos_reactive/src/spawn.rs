@@ -16,7 +16,11 @@ where
         else if #[cfg(any(test, doctest))] {
             tokio_test::block_on(fut);
         } else if #[cfg(feature = "ssr")] {
-            tokio::task::spawn_local(fut);
+            use crate::Runtime;
+
+            let handle = tokio::task::spawn_local(fut);
+            let task = handle.id();
+            Runtime::register_task_with_runtime(task, Runtime::current());
         }  else {
             futures::executor::block_on(fut)
         }

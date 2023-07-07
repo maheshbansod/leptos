@@ -1,8 +1,8 @@
-use leptos::{component, view, IntoView, Scope};
+use leptos::{component, view, IntoView};
 use leptos_router::*;
 
 #[component]
-pub fn Nav(cx: Scope) -> impl IntoView {
+pub fn Nav() -> impl IntoView {
     view! { cx,
         <header class="header">
             <nav class="inner">

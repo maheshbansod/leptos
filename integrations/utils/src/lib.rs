@@ -1,5 +1,5 @@
 use futures::{Stream, StreamExt};
-use leptos::{use_context, RuntimeId, ScopeId};
+use leptos::{use_context, RuntimeId};
 use leptos_config::LeptosOptions;
 use leptos_meta::MetaContext;
 
@@ -124,7 +124,6 @@ pub async fn build_async_response(
     stream: impl Stream<Item = String> + 'static,
     options: &LeptosOptions,
     runtime: RuntimeId,
-    scope: ScopeId,
 ) -> String {
     let mut buf = String::new();
     let mut stream = Box::pin(stream);
@@ -132,12 +131,11 @@ pub async fn build_async_response(
         buf.push_str(&chunk);
     }
 
-    let cx = leptos::Scope { runtime, id: scope };
     let (head, tail) =
-        html_parts_separated(options, use_context::<MetaContext>(cx).as_ref());
+        html_parts_separated(options, use_context::<MetaContext>().as_ref());
 
     // in async, we load the meta content *now*, after the suspenses have resolved
-    let meta = use_context::<MetaContext>(cx);
+    let meta = use_context::<MetaContext>();
     let head_meta = meta
         .as_ref()
         .map(|meta| meta.dehydrate())

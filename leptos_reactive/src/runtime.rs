@@ -2,11 +2,13 @@
 
 use crate::{
     hydration::SharedContext,
-    node::{NodeId, ReactiveNode, ReactiveNodeState, ReactiveNodeType},
+    node::{
+        Disposer, NodeId, ReactiveNode, ReactiveNodeState, ReactiveNodeType,
+    },
     AnyComputation, AnyResource, Effect, Memo, MemoState, ReadSignal,
-    ResourceId, ResourceState, RwSignal, Scope, ScopeDisposer, ScopeId,
-    ScopeProperty, SerializableResource, SpecialNonReactiveZone, StoredValueId,
-    Trigger, UnserializableResource, WriteSignal,
+    ResourceId, ResourceState, RwSignal, SerializableResource,
+    SpecialNonReactiveZone, StoredValueId, Trigger, UnserializableResource,
+    WriteSignal,
 };
 use cfg_if::cfg_if;
 use core::hash::BuildHasherDefault;
@@ -32,8 +34,16 @@ cfg_if! {
             pub(crate) static RUNTIME: Runtime = Runtime::new();
         }
     } else {
+        use std::collections::HashMap;
+
         thread_local! {
             pub(crate) static RUNTIMES: RefCell<SlotMap<RuntimeId, Runtime>> = Default::default();
+
+            pub(crate) static CURRENT_RUNTIME: Cell<Option<RuntimeId>> = Default::default();
+
+            // Stores the
+            pub(crate) static TASK_RUNTIMES: RefCell<HashMap<tokio::task::Id, RuntimeId>> = Default::default();
+            pub(crate) static RUNTIME_TASKS: RefCell<SecondaryMap<RuntimeId, Vec<tokio::task::Id>>> = Default::default();
         }
     }
 }
@@ -45,25 +55,31 @@ type FxIndexSet<T> = IndexSet<T, BuildHasherDefault<FxHasher>>;
 #[derive(Default)]
 pub(crate) struct Runtime {
     pub shared_context: RefCell<SharedContext>,
+    pub owner: Cell<Option<NodeId>>,
     pub observer: Cell<Option<NodeId>>,
-    pub scopes: RefCell<SlotMap<ScopeId, RefCell<Vec<ScopeProperty>>>>,
-    pub scope_parents: RefCell<SparseSecondaryMap<ScopeId, ScopeId>>,
-    pub scope_children: RefCell<SparseSecondaryMap<ScopeId, Vec<ScopeId>>>,
     #[allow(clippy::type_complexity)]
-    pub scope_contexts:
-        RefCell<SparseSecondaryMap<ScopeId, FxHashMap<TypeId, Box<dyn Any>>>>,
-    #[allow(clippy::type_complexity)]
-    pub scope_cleanups:
-        RefCell<SparseSecondaryMap<ScopeId, Vec<Box<dyn FnOnce()>>>>,
+    pub on_cleanups:
+        RefCell<SparseSecondaryMap<NodeId, Vec<Box<dyn FnOnce()>>>>,
     pub stored_values: RefCell<SlotMap<StoredValueId, Rc<RefCell<dyn Any>>>>,
     pub nodes: RefCell<SlotMap<NodeId, ReactiveNode>>,
     pub node_subscribers:
         RefCell<SecondaryMap<NodeId, RefCell<FxIndexSet<NodeId>>>>,
     pub node_sources:
         RefCell<SecondaryMap<NodeId, RefCell<FxIndexSet<NodeId>>>>,
+    pub node_owners: RefCell<SecondaryMap<NodeId, NodeId>>,
+    pub node_properties:
+        RefCell<SparseSecondaryMap<NodeId, Vec<ScopeProperty>>>,
+    #[allow(clippy::type_complexity)]
+    pub contexts:
+        RefCell<SparseSecondaryMap<NodeId, FxHashMap<TypeId, Box<dyn Any>>>>,
     pub pending_effects: RefCell<Vec<NodeId>>,
     pub resources: RefCell<SlotMap<ResourceId, AnyResource>>,
     pub batching: Cell<bool>,
+}
+
+/// The current reactive runtime.
+pub fn current_runtime() -> RuntimeId {
+    Runtime::current()
 }
 
 // This core Runtime impl block handles all the work of marking and updating
@@ -72,8 +88,47 @@ pub(crate) struct Runtime {
 // In terms of concept and algorithm, this reactive-system implementation
 // is significantly inspired by Reactively (https://github.com/modderme123/reactively)
 impl Runtime {
+    #[inline(always)]
+    pub fn current() -> RuntimeId {
+        cfg_if! {
+            if #[cfg(any(feature = "csr", feature = "hydrate"))] {
+                Default::default()
+            } else {
+                // either use the runtime associated with the current task,
+                // or the current runtime
+                tokio::task::try_id()
+                    .and_then(|id| TASK_RUNTIMES.with(|map| map.borrow().get(&id).copied()))
+                    .unwrap_or_else(|| {
+                        CURRENT_RUNTIME.with(|id| id.get()).unwrap_or_default()
+                    })
+            }
+        }
+    }
+
+    #[cfg(not(any(feature = "csr", feature = "hydrate")))]
+    #[inline(always)]
+    pub(crate) fn set_runtime(id: Option<RuntimeId>) {
+        CURRENT_RUNTIME.with(|curr| curr.set(id))
+    }
+
+    #[cfg(feature = "ssr")]
+    pub(crate) fn register_task_with_runtime(
+        task: tokio::task::Id,
+        runtime: RuntimeId,
+    ) {
+        TASK_RUNTIMES.with(|map| {
+            map.borrow_mut().insert(task, runtime);
+        });
+        RUNTIME_TASKS.with(|map| {
+            let mut map = map.borrow_mut();
+            if let Some(entry) = map.entry(runtime) {
+                let tasks = entry.or_default();
+                tasks.push(task);
+            }
+        })
+    }
+
     pub(crate) fn update_if_necessary(&self, node_id: NodeId) {
-        //crate::macros::debug_warn!("update_if_necessary {node_id:?}");
         if self.current_state(node_id) == ReactiveNodeState::Check {
             let sources = {
                 let sources = self.node_sources.borrow();
@@ -100,6 +155,9 @@ impl Runtime {
 
         // if we're dirty at this point, update
         if self.current_state(node_id) >= ReactiveNodeState::Dirty {
+            self.cleanup_node(node_id);
+
+            // now, update the value
             self.update(node_id);
         }
 
@@ -107,8 +165,26 @@ impl Runtime {
         self.mark_clean(node_id);
     }
 
+    pub(crate) fn cleanup_node(&self, node_id: NodeId) {
+        // first, run our cleanups, if any
+        if let Some(cleanups) =
+            { self.on_cleanups.borrow_mut().remove(node_id) }
+        {
+            for cleanup in cleanups {
+                cleanup();
+            }
+        }
+
+        // dispose of any of our properties
+        let properties = { self.node_properties.borrow_mut().remove(node_id) };
+        if let Some(properties) = properties {
+            for property in properties {
+                self.cleanup_property(property);
+            }
+        }
+    }
+
     pub(crate) fn update(&self, node_id: NodeId) {
-        //crate::macros::debug_warn!("updating {node_id:?}");
         let node = {
             let nodes = self.nodes.borrow();
             nodes.get(node_id).cloned()
@@ -125,7 +201,7 @@ impl Runtime {
                     // set this node as the observer
                     self.with_observer(node_id, move || {
                         // clean up sources of this memo/effect
-                        self.cleanup(node_id);
+                        self.cleanup_sources(node_id);
 
                         f.run(value)
                     })
@@ -140,9 +216,6 @@ impl Runtime {
                     let mut nodes = self.nodes.borrow_mut();
                     for sub_id in subs.borrow().iter() {
                         if let Some(sub) = nodes.get_mut(*sub_id) {
-                            //crate::macros::debug_warn!(
-                            //    "update is marking {sub_id:?} dirty"
-                            //);
                             sub.state = ReactiveNodeState::Dirty;
                         }
                     }
@@ -154,7 +227,55 @@ impl Runtime {
         }
     }
 
-    pub(crate) fn cleanup(&self, node_id: NodeId) {
+    pub(crate) fn cleanup_property(&self, property: ScopeProperty) {
+        // for signals, triggers, memos, effects, shared node cleanup
+        match property {
+            ScopeProperty::Signal(node)
+            | ScopeProperty::Trigger(node)
+            | ScopeProperty::Effect(node) => {
+                // clean up all children
+                let properties =
+                    { self.node_properties.borrow_mut().remove(node) };
+                for property in properties.into_iter().flatten() {
+                    self.cleanup_property(property);
+                }
+
+                // run all cleanups for this node
+                let cleanups = { self.on_cleanups.borrow_mut().remove(node) };
+                for cleanup in cleanups.into_iter().flatten() {
+                    cleanup();
+                }
+
+                // each of the subs needs to remove the node from its dependencies
+                // so that it doesn't try to read the (now disposed) signal
+                let subs = self.node_subscribers.borrow_mut().remove(node);
+
+                if let Some(subs) = subs {
+                    let source_map = self.node_sources.borrow();
+                    for effect in subs.borrow().iter() {
+                        if let Some(effect_sources) = source_map.get(*effect) {
+                            effect_sources.borrow_mut().remove(&node);
+                        }
+                    }
+                }
+
+                // no longer needs to track its sources
+                self.node_sources.borrow_mut().remove(node);
+
+                // remove the node from the graph
+                let node = { self.nodes.borrow_mut().remove(node) };
+                drop(node);
+            }
+            ScopeProperty::Resource(id) => {
+                self.resources.borrow_mut().remove(id);
+            }
+            ScopeProperty::StoredValue(id) => {
+                self.stored_values.borrow_mut().remove(id);
+            }
+        }
+    }
+
+    pub(crate) fn cleanup_sources(&self, node_id: NodeId) {
         let sources = self.node_sources.borrow();
         if let Some(sources) = sources.get(node_id) {
             let subs = self.node_subscribers.borrow();
@@ -174,15 +295,19 @@ impl Runtime {
     }
 
     fn with_observer<T>(&self, observer: NodeId, f: impl FnOnce() -> T) -> T {
+        // take previous observer and owner
         let prev_observer = self.observer.take();
+        let prev_owner = self.owner.take();
+
+        self.owner.set(Some(observer));
         self.observer.set(Some(observer));
         let v = f();
         self.observer.set(prev_observer);
+        self.owner.set(prev_owner);
         v
     }
 
     fn mark_clean(&self, node: NodeId) {
-        //crate::macros::debug_warn!("marking {node:?} clean");
         let mut nodes = self.nodes.borrow_mut();
         if let Some(node) = nodes.get_mut(node) {
             node.state = ReactiveNodeState::Clean;
@@ -190,7 +315,6 @@ impl Runtime {
     }
 
     pub(crate) fn mark_dirty(&self, node: NodeId) {
-        //crate::macros::debug_warn!("marking {node:?} dirty");
         let mut nodes = self.nodes.borrow_mut();
 
         if let Some(current_node) = nodes.get_mut(node) {
@@ -315,15 +439,12 @@ impl Runtime {
         pending_effects: &mut Vec<NodeId>,
         current_observer: Option<NodeId>,
     ) {
-        //crate::macros::debug_warn!("marking {node_id:?} {level:?}");
         if level > node.state {
             node.state = level;
         }
 
         if matches!(node.node_type, ReactiveNodeType::Effect { .. } if current_observer != Some(node_id))
         {
-            //crate::macros::debug_warn!("pushing effect {node_id:?}");
-            //debug_assert!(!pending_effects.contains(&node_id));
             pending_effects.push(node_id)
         }
 
@@ -346,17 +467,104 @@ impl Runtime {
         self.node_subscribers.borrow_mut().remove(node);
         self.nodes.borrow_mut().remove(node);
     }
+
+    #[track_caller]
+    pub(crate) fn register_property(
+        &self,
+        property: ScopeProperty,
+        #[cfg(debug_assertions)] defined_at: &'static std::panic::Location<
+            'static,
+        >,
+    ) {
+        let mut properties = self.node_properties.borrow_mut();
+        if let Some(owner) = self.owner.get() {
+            if let Some(entry) = properties.entry(owner) {
+                let entry = entry.or_default();
+                entry.push(property);
+            }
+
+            if let Some(node) = property.to_node_id() {
+                let mut owners = self.node_owners.borrow_mut();
+                owners.insert(node, owner);
+            }
+        } else {
+            crate::macros::debug_warn!(
+                "At {defined_at}, you are creating a reactive value outside \
+                 the reactive root.",
+            );
+        }
+    }
+
+    pub(crate) fn get_context<T: Clone + 'static>(
+        &self,
+        node: NodeId,
+        ty: TypeId,
+    ) -> Option<T> {
+        let contexts = self.contexts.borrow();
+
+        let context = contexts.get(node);
+        let local_value = context.and_then(|context| {
+            context
+                .get(&ty)
+                .and_then(|val| val.downcast_ref::<T>())
+                .cloned()
+        });
+        match local_value {
+            Some(val) => Some(val),
+            None => self
+                .node_owners
+                .borrow()
+                .get(node)
+                .and_then(|parent| self.get_context(*parent, ty)),
+        }
+    }
+
+    #[cfg_attr(
+        any(debug_assertions, features = "ssr"),
+        instrument(level = "trace", skip_all,)
+    )]
+    #[track_caller]
+    pub(crate) fn push_scope_property(&self, prop: ScopeProperty) {
+        #[cfg(debug_assertions)]
+        let defined_at = std::panic::Location::caller();
+        self.register_property(
+            prop,
+            #[cfg(debug_assertions)]
+            defined_at,
+        );
+    }
+
+    #[cfg_attr(
+        any(debug_assertions, features = "ssr"),
+        instrument(level = "trace", skip_all,)
+    )]
+    #[track_caller]
+    pub(crate) fn remove_scope_property(
+        &self,
+        owner: NodeId,
+        property: ScopeProperty,
+    ) {
+        let mut properties = self.node_properties.borrow_mut();
+        if let Some(properties) = properties.get_mut(owner) {
+            // remove this property from the list, if found
+            if let Some(index) = properties.iter().position(|p| p == &property)
+            {
+                // order of properties doesn't matter so swap_remove
+                // is the most efficient way to remove
+                properties.swap_remove(index);
+            }
+        }
+
+        if let Some(node) = property.to_node_id() {
+            let mut owners = self.node_owners.borrow_mut();
+            owners.remove(node);
+        }
+    }
 }
 
 impl Debug for Runtime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Runtime")
-            .field("shared_context", &self.shared_context)
-            .field("observer", &self.observer)
-            .field("scopes", &self.scopes)
-            .field("scope_parents", &self.scope_parents)
-            .field("scope_children", &self.scope_children)
-            .finish()
+        f.debug_struct("Runtime").finish()
     }
 }
 
@@ -388,15 +596,24 @@ pub(crate) fn with_runtime<T>(
     }
 }
 
-#[doc(hidden)]
 #[must_use = "Runtime will leak memory if Runtime::dispose() is never called."]
-/// Creates a new reactive [`Runtime`]. This should almost always be handled by the framework.
+/// Creates a new reactive [`Runtime`] and sets it as the current runtime.
+/// This should almost always be handled by the framework, not called directly in user code.
 pub fn create_runtime() -> RuntimeId {
     cfg_if! {
         if #[cfg(any(feature = "csr", feature = "hydrate"))] {
             Default::default()
         } else {
-            RUNTIMES.with(|runtimes| runtimes.borrow_mut().insert(Runtime::new()))
+            let id = RUNTIMES.with(|runtimes| runtimes.borrow_mut().insert(Runtime::new()));
+            Runtime::set_runtime(Some(id));
+
+            // associate the Tokio task with the current runtime, if applicable
+            #[cfg(feature = "ssr")]
+            if let Some(task) = tokio::task::try_id() {
+                Runtime::register_task_with_runtime(task, id);
+            }
+
+            id
         }
     }
 }
@@ -412,66 +629,117 @@ slotmap::new_key_type! {
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RuntimeId;
 
+/// Wraps the given function so that, whenever it is called, it creates
+/// a child node owned by whichever reactive node was the owner
+/// when it was created, runs the function, and returns a disposer that
+/// can be used to dispose of the child later.
+///
+/// This can be used to hoist children created inside an effect up to
+/// the level of a higher parent, to prevent each one from being disposed
+/// every time the effect within which they're created is run.
+///
+/// For example, each row in a `<For/>` component could be created using this,
+/// so that they are owned by the `<For/>` component itself, not an effect
+/// running within it.
+pub fn as_child_of_current_owner<T, U>(
+    f: impl Fn(T) -> U + 'static,
+) -> impl Fn(T) -> (U, Disposer)
+where
+    T: 'static,
+{
+    let runtime_id = Runtime::current();
+    let owner = with_runtime(runtime_id, |runtime| runtime.owner.get())
+        .expect("runtime should be alive when created");
+    move |t| {
+        with_runtime(runtime_id, |runtime| {
+            let prev_observer = runtime.observer.take();
+            let prev_owner = runtime.owner.take();
+
+            runtime.owner.set(owner);
+            runtime.observer.set(owner);
+
+            let id = runtime.nodes.borrow_mut().insert(ReactiveNode {
+                value: None,
+                state: ReactiveNodeState::Clean,
+                node_type: ReactiveNodeType::Trigger,
+            });
+            runtime.push_scope_property(ScopeProperty::Trigger(id));
+            let disposer = Disposer((runtime_id, id));
+
+            runtime.owner.set(Some(id));
+            runtime.observer.set(Some(id));
+
+            let v = f(t);
+
+            runtime.observer.set(prev_observer);
+            runtime.owner.set(prev_owner);
+
+            (v, disposer)
+        })
+        .expect("runtime should be alive when run")
+    }
+}
+
+/// Wraps the given function so that, whenever it is called, it is run
+/// in the reactive scope of whatever the reactive owner was when it was
+/// created.
+pub fn with_current_owner<T, U>(f: impl Fn(T) -> U + 'static) -> impl Fn(T) -> U
+where
+    T: 'static,
+{
+    let runtime_id = Runtime::current();
+    let owner = with_runtime(runtime_id, |runtime| runtime.owner.get())
+        .expect("runtime should be alive when created");
+    move |t| {
+        with_runtime(runtime_id, |runtime| {
+            let prev_observer = runtime.observer.take();
+            let prev_owner = runtime.owner.take();
+
+            runtime.owner.set(owner);
+            runtime.observer.set(owner);
+
+            let v = f(t);
+
+            runtime.observer.set(prev_observer);
+            runtime.owner.set(prev_owner);
+
+            v
+        })
+        .expect("runtime should be alive when run")
+    }
+}
+
 impl RuntimeId {
-    /// Removes the runtime, disposing all its child [`Scope`](crate::Scope)s.
+    /// Removes the runtime, disposing of everything created in it.
     pub fn dispose(self) {
         cfg_if! {
             if #[cfg(not(any(feature = "csr", feature = "hydrate")))] {
+                // get the list of async tasks associated with this
+                let tasks = RUNTIME_TASKS.with(|map| {
+                    map.borrow_mut().remove(self).unwrap_or_default()
+                });
+
+                // and remove each task from the task map
+                TASK_RUNTIMES.with(move |map| {
+                    let mut map = map.borrow_mut();
+                    for task in tasks {
+                        map.remove(&task);
+                    }
+                });
+
+                // remove this from the set of runtimes
                 let runtime = RUNTIMES.with(move |runtimes| runtimes.borrow_mut().remove(self));
+
+                // remove this from being the current runtime
+                CURRENT_RUNTIME.with(|runtime| {
+                    if runtime.get() == Some(self) {
+                        runtime.take();
+                    }
+                });
+
                 drop(runtime);
             }
         }
-    }
-
-    pub(crate) fn raw_scope_and_disposer(self) -> (Scope, ScopeDisposer) {
-        with_runtime(self, |runtime| {
-            let id = { runtime.scopes.borrow_mut().insert(Default::default()) };
-            let scope = Scope { runtime: self, id };
-            let disposer = ScopeDisposer(scope);
-            (scope, disposer)
-        })
-        .expect(
-            "tried to create raw scope in a runtime that has already been \
-             disposed",
-        )
-    }
-
-    pub(crate) fn raw_scope_and_disposer_with_parent(
-        self,
-        parent: Option<Scope>,
-    ) -> (Scope, ScopeDisposer) {
-        with_runtime(self, |runtime| {
-            let id = { runtime.scopes.borrow_mut().insert(Default::default()) };
-            if let Some(parent) = parent {
-                runtime.scope_parents.borrow_mut().insert(id, parent.id);
-            }
-            let scope = Scope { runtime: self, id };
-            let disposer = ScopeDisposer(scope);
-            (scope, disposer)
-        })
-        .expect("tried to crate scope in a runtime that has been disposed")
-    }
-
-    #[inline(always)]
-    pub(crate) fn run_scope_undisposed<T>(
-        self,
-        f: impl FnOnce(Scope) -> T,
-        parent: Option<Scope>,
-    ) -> (T, ScopeId, ScopeDisposer) {
-        let (scope, disposer) = self.raw_scope_and_disposer_with_parent(parent);
-
-        (f(scope), scope.id, disposer)
-    }
-
-    #[inline(always)]
-    pub(crate) fn run_scope<T>(
-        self,
-        f: impl FnOnce(Scope) -> T,
-        parent: Option<Scope>,
-    ) -> T {
-        let (ret, _, disposer) = self.run_scope_undisposed(f, parent);
-        disposer.dispose();
-        ret
     }
 
     #[cfg_attr(
@@ -515,11 +783,13 @@ impl RuntimeId {
     #[inline(always)] // only because it's placed here to fit in with the other create methods
     pub(crate) fn create_trigger(self) -> Trigger {
         let id = with_runtime(self, |runtime| {
-            runtime.nodes.borrow_mut().insert(ReactiveNode {
+            let id = runtime.nodes.borrow_mut().insert(ReactiveNode {
                 value: None,
                 state: ReactiveNodeState::Clean,
                 node_type: ReactiveNodeType::Trigger,
-            })
+            });
+            runtime.push_scope_property(ScopeProperty::Trigger(id));
+            id
         })
         .expect(
             "tried to create a trigger in a runtime that has been disposed",
@@ -538,11 +808,13 @@ impl RuntimeId {
         value: Rc<RefCell<dyn Any>>,
     ) -> NodeId {
         with_runtime(self, |runtime| {
-            runtime.nodes.borrow_mut().insert(ReactiveNode {
+            let id = runtime.nodes.borrow_mut().insert(ReactiveNode {
                 value: Some(value),
                 state: ReactiveNodeState::Clean,
                 node_type: ReactiveNodeType::Signal,
-            })
+            });
+            runtime.push_scope_property(ScopeProperty::Signal(id));
+            id
         })
         .expect("tried to create a signal in a runtime that has been disposed")
     }
@@ -579,62 +851,6 @@ impl RuntimeId {
     }
 
     #[track_caller]
-    pub(crate) fn create_many_signals_with_map<T, U>(
-        self,
-        cx: Scope,
-        values: impl IntoIterator<Item = T>,
-        map_fn: impl Fn((ReadSignal<T>, WriteSignal<T>)) -> U,
-    ) -> Vec<U>
-    where
-        T: Any + 'static,
-    {
-        with_runtime(self, move |runtime| {
-            let mut signals = runtime.nodes.borrow_mut();
-            let properties = runtime.scopes.borrow();
-            let mut properties = properties
-                .get(cx.id)
-                .expect(
-                    "tried to add signals to a scope that has been disposed",
-                )
-                .borrow_mut();
-            let values = values.into_iter();
-            let size = values.size_hint().0;
-            signals.reserve(size);
-            properties.reserve(size);
-            values
-                .map(|value| {
-                    signals.insert(ReactiveNode {
-                        value: Some(Rc::new(RefCell::new(value))),
-                        state: ReactiveNodeState::Clean,
-                        node_type: ReactiveNodeType::Signal,
-                    })
-                })
-                .map(|id| {
-                    properties.push(ScopeProperty::Signal(id));
-                    (
-                        ReadSignal {
-                            runtime: self,
-                            id,
-                            ty: PhantomData,
-                            #[cfg(any(debug_assertions, feature = "ssr"))]
-                            defined_at: std::panic::Location::caller(),
-                        },
-                        WriteSignal {
-                            runtime: self,
-                            id,
-                            ty: PhantomData,
-                            #[cfg(any(debug_assertions, feature = "ssr"))]
-                            defined_at: std::panic::Location::caller(),
-                        },
-                    )
-                })
-                .map(map_fn)
-                .collect()
-        })
-        .expect("tried to create a signal in a runtime that has been disposed")
-    }
-
-    #[track_caller]
     #[inline(always)]
     pub(crate) fn create_rw_signal<T>(self, value: T) -> RwSignal<T>
     where
@@ -643,10 +859,6 @@ impl RuntimeId {
         let id = self.create_concrete_signal(
             Rc::new(RefCell::new(value)) as Rc<RefCell<dyn Any>>
         );
-        //crate::macros::debug_warn!(
-        //    "created RwSignal {id:?} at {:?}",
-        //    std::panic::Location::caller()
-        //);
         RwSignal {
             runtime: self,
             id,
@@ -664,20 +876,12 @@ impl RuntimeId {
         with_runtime(self, |runtime| {
             let id = runtime.nodes.borrow_mut().insert(ReactiveNode {
                 value: Some(Rc::clone(&value)),
-                state: ReactiveNodeState::Clean,
+                state: ReactiveNodeState::Dirty,
                 node_type: ReactiveNodeType::Effect {
                     f: Rc::clone(&effect),
                 },
             });
-
-            // run the effect for the first time
-            let prev_observer = runtime.observer.take();
-            runtime.observer.set(Some(id));
-
-            effect.run(value);
-
-            runtime.observer.set(prev_observer);
-
+            runtime.push_scope_property(ScopeProperty::Effect(id));
             id
         })
         .expect("tried to create an effect in a runtime that has been disposed")
@@ -689,13 +893,15 @@ impl RuntimeId {
         computation: Rc<dyn AnyComputation>,
     ) -> NodeId {
         with_runtime(self, |runtime| {
-            runtime.nodes.borrow_mut().insert(ReactiveNode {
+            let id = runtime.nodes.borrow_mut().insert(ReactiveNode {
                 value: Some(value),
                 // memos are lazy, so are dirty when created
                 // will be run the first time we ask for it
                 state: ReactiveNodeState::Dirty,
                 node_type: ReactiveNodeType::Memo { f: computation },
-            })
+            });
+            runtime.push_scope_property(ScopeProperty::Effect(id));
+            id
         })
         .expect("tried to create a memo in a runtime that has been disposed")
     }
@@ -824,7 +1030,19 @@ impl RuntimeId {
 
 impl Runtime {
     pub fn new() -> Self {
-        Self::default()
+        let root = ReactiveNode {
+            value: None,
+            state: ReactiveNodeState::Clean,
+            node_type: ReactiveNodeType::Trigger,
+        };
+        let mut nodes: SlotMap<NodeId, ReactiveNode> = SlotMap::default();
+        let root_id = nodes.insert(root);
+
+        Self {
+            owner: Cell::new(Some(root_id)),
+            nodes: RefCell::new(nodes),
+            ..Self::default()
+        }
     }
 
     pub(crate) fn create_unserializable_resource(
@@ -907,13 +1125,12 @@ impl Runtime {
 
     pub(crate) fn serialization_resolvers(
         &self,
-        cx: Scope,
     ) -> FuturesUnordered<PinnedFuture<(ResourceId, String)>> {
         let f = FuturesUnordered::new();
         let resources = { self.resources.borrow().clone() };
         for (id, resource) in resources.iter() {
             if let AnyResource::Serializable(resource) = resource {
-                f.push(resource.to_serialization_resolver(cx, id));
+                f.push(resource.to_serialization_resolver(id));
             }
         }
         f
@@ -951,4 +1168,132 @@ impl Drop for SetObserverOnDrop {
             rt.observer.set(self.1);
         });
     }
+}
+
+/// Batches any reactive updates, preventing effects from running until the whole
+/// function has run. This allows you to prevent rerunning effects if multiple
+/// signal updates might cause the same effect to run.
+///
+/// # Panics
+/// Panics if the runtime has already been disposed.
+#[cfg_attr(
+    any(debug_assertions, features = "ssr"),
+    instrument(level = "trace", skip_all,)
+)]
+#[inline(always)]
+pub fn batch<T>(f: impl FnOnce() -> T) -> T {
+    let runtime_id = Runtime::current();
+    with_runtime(runtime_id, move |runtime| {
+        let batching = SetBatchingOnDrop(runtime_id, runtime.batching.get());
+        runtime.batching.set(true);
+
+        let val = f();
+
+        runtime.batching.set(batching.1);
+        std::mem::forget(batching);
+
+        runtime.run_effects();
+        val
+    })
+    .expect("tried to run a batched update in a runtime that has been disposed")
+}
+
+struct SetBatchingOnDrop(RuntimeId, bool);
+
+impl Drop for SetBatchingOnDrop {
+    fn drop(&mut self) {
+        _ = with_runtime(self.0, |rt| {
+            rt.batching.set(self.1);
+        });
+    }
+}
+
+/// Creates a cleanup function, which will be run when a [`Scope`] is disposed.
+///
+/// It runs after child scopes have been disposed, but before signals, effects, and resources
+/// are invalidated.
+#[inline(always)]
+pub fn on_cleanup(cleanup_fn: impl FnOnce() + 'static) {
+    push_cleanup(Box::new(cleanup_fn))
+}
+
+#[cfg_attr(
+    any(debug_assertions, features = "ssr"),
+    instrument(level = "trace", skip_all,)
+)]
+fn push_cleanup(cleanup_fn: Box<dyn FnOnce()>) {
+    _ = with_runtime(Runtime::current(), |runtime| {
+        if let Some(owner) = runtime.owner.get() {
+            let mut cleanups = runtime.on_cleanups.borrow_mut();
+            if let Some(entries) = cleanups.get_mut(owner) {
+                entries.push(cleanup_fn);
+            } else {
+                cleanups.insert(owner, vec![cleanup_fn]);
+            }
+        }
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopeProperty {
+    Trigger(NodeId),
+    Signal(NodeId),
+    Effect(NodeId),
+    Resource(ResourceId),
+    StoredValue(StoredValueId),
+}
+
+impl ScopeProperty {
+    pub fn to_node_id(self) -> Option<NodeId> {
+        match self {
+            Self::Trigger(node) | Self::Signal(node) | Self::Effect(node) => {
+                Some(node)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Suspends reactive tracking while running the given function.
+///
+/// This can be used to isolate parts of the reactive graph from one another.
+///
+/// ```
+/// # use leptos_reactive::*;
+/// # run_scope(create_runtime(), |cx| {
+/// let (a, set_a) = create_signal(cx, 0);
+/// let (b, set_b) = create_signal(cx, 0);
+/// let c = create_memo(cx, move |_| {
+///     // this memo will *only* update when `a` changes
+///     a() + cx.untrack(move || b())
+/// });
+///
+/// assert_eq!(c(), 0);
+/// set_a(1);
+/// assert_eq!(c(), 1);
+/// set_b(1);
+/// // hasn't updated, because we untracked before reading b
+/// assert_eq!(c(), 1);
+/// set_a(2);
+/// assert_eq!(c(), 3);
+///
+/// # });
+/// ```
+#[cfg_attr(
+    any(debug_assertions, features = "ssr"),
+    instrument(level = "trace", skip_all,)
+)]
+#[inline(always)]
+pub fn untrack<T>(f: impl FnOnce() -> T) -> T {
+    Runtime::current().untrack(f, false)
+}
+
+#[doc(hidden)]
+#[cfg_attr(
+    any(debug_assertions, features = "ssr"),
+    instrument(level = "trace", skip_all,)
+)]
+#[inline(always)]
+pub fn untrack_with_diagnostics<T>(f: impl FnOnce() -> T) -> T {
+    Runtime::current().untrack(f, true)
 }
